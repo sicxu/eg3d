@@ -19,6 +19,7 @@ import torch
 import dnnlib
 import torchvision.transforms as transforms
 from torchvision.transforms import functional as F
+import time
 
 try:
     import pyspng
@@ -302,5 +303,72 @@ class SDIP(torch.utils.data.Dataset):
 
     def get_label(self, idx):
         return np.zeros([self.label_dim])
-    
+
+
+class ImageNet(torch.utils.data.Dataset):
+    def __init__(self,
+        path,                   # Path to directory or zip.
+        image_size      = 128, # Ensure specific resolution, None = highest available.
+        **super_kwargs,         # Additional arguments for the Dataset base class.
+    ):
+        self.path = path
+        self.has_labels = True
+
+        info = json.load(open(os.path.join(path, 'dataset.json'), 'r'))
+        self.images = info['images']
+        label_mapping = info['labels']
+
+        self.labels = np.array([label_mapping[name.split('/')[-2]] for name in self.images]).astype(np.int64)
+        self.label_shape = [np.max(self.labels) + 1]
+        
+
+        self.transform = transforms.Compose([
+            transforms.Resize(image_size, interpolation=F.InterpolationMode.LANCZOS),
+            transforms.CenterCrop(image_size),
+        ])
+
+        self.image_shape = [3, image_size, image_size]
+        self.resolution = image_size
+        self.num_channels = 3
+        self.name = "ImageNet"
+
+
+    def __getitem__(self, idx):
+        image = PIL.Image.open(os.path.join(self.path, self.images[idx]))
+        image = np.array(self.transform(image))
+        if image.ndim == 2:
+            image = image[:, :, np.newaxis] # HW => HWC
+
+        if image.shape[-1] == 1: image = np.repeat(image, 3, axis=-1)
+        if image.shape[-1] == 4: image = image[..., :3]
+
+        image = image.transpose(2, 0, 1) # HWC => CHW
+        return image.copy(), self.get_label(idx)
+
+
+    def __len__(self):
+        return len(self.images)
+
+
+    def get_label(self, idx):
+        label = self.labels[idx]
+        if label.dtype == np.int64:
+            onehot = np.zeros(self.label_shape, dtype=np.float32)
+            onehot[label] = 1
+            label = onehot
+        return label.copy()
+
+
+    @property
+    def label_dim(self):
+        assert len(self.label_shape) == 1
+        return self.label_shape[0]
+
+
+    def get_details(self, idx):
+        d = dnnlib.EasyDict()
+        d.raw_idx = int(idx)
+        d.xflip = False
+        d.raw_label = self.labels[d.raw_idx].copy()
+        return d
 #----------------------------------------------------------------------------
