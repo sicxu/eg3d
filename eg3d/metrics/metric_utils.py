@@ -19,7 +19,7 @@ import uuid
 import numpy as np
 import torch
 import dnnlib
-
+from camera_utils import LookAtPoseSampler
 #----------------------------------------------------------------------------
 
 class MetricOptions:
@@ -67,6 +67,27 @@ def iterate_random_labels(opts, batch_size):
             c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(batch_size)]
             c = torch.from_numpy(np.stack(c)).pin_memory().to(opts.device)
             yield c
+
+
+def iterate_random_pose(rendering_kwargs, batch_size, device='cpu'):
+    while True:
+        lookat_position = torch.tensor(rendering_kwargs['avg_camera_pivot'], dtype=torch.float32, device=device)
+        lookat_position = lookat_position.unsqueeze(0).repeat(batch_size, 1)
+        forward_cam2world_pose = LookAtPoseSampler.sample(
+                    3.14/2, 3.14/2, 
+                    lookat_position=lookat_position,
+                    horizontal_stddev=rendering_kwargs['h_std'], 
+                    vertical_stddev=rendering_kwargs['v_std'], 
+                    radius=rendering_kwargs['avg_camera_radius'], 
+                    batch_size=batch_size,
+                    device=device)
+                
+        intrinsics = torch.tensor([[4.2647, 0, 0.5], [0, 4.2647, 0.5], [0, 0, 1]], device=device)
+        intrinsics = intrinsics.unsqueeze(0).repeat(batch_size, 1, 1)
+        pose = torch.cat([forward_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
+        yield pose
+
+
 
 #----------------------------------------------------------------------------
 
@@ -255,7 +276,7 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
     # Setup generator and labels.
     G = copy.deepcopy(opts.G).eval().requires_grad_(False).to(opts.device)
     c_iter = iterate_random_labels(opts=opts, batch_size=batch_gen)
-
+    pose_iter = iterate_random_pose(opts.G.rendering_kwargs, batch_size=batch_gen, device=opts.device)
     # Initialize.
     stats = FeatureStats(**stats_kwargs)
     assert stats.max_items is not None
@@ -267,7 +288,7 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
         images = []
         for _i in range(batch_size // batch_gen):
             z = torch.randn([batch_gen, G.z_dim], device=opts.device)
-            img = G(z=z, c=next(c_iter), **opts.G_kwargs)['image']
+            img = G(z=z, c=next(c_iter), pose=next(pose_iter), **opts.G_kwargs)['image']
             img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)
             images.append(img)
         images = torch.cat(images)

@@ -17,6 +17,8 @@ import PIL.Image
 import json
 import torch
 import dnnlib
+import torchvision.transforms as transforms
+from torchvision.transforms import functional as F
 
 try:
     import pyspng
@@ -241,4 +243,64 @@ class ImageFolderDataset(Dataset):
         labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
         return labels
 
+#----------------------------------------------------------------------------
+
+class SDIP(torch.utils.data.Dataset):
+    def __init__(self,
+        path,                   # Path to directory or zip.
+        image_size      = 128, # Ensure specific resolution, None = highest available.
+        **super_kwargs,         # Additional arguments for the Dataset base class.
+    ):
+        self.path = path
+        if os.path.isfile(os.path.join(path, 'dataset.json')):
+            info = json.load(open(os.path.join(path, 'dataset.json'), 'r'))
+            self.images = info['images']
+        else:
+            for i in range(10):
+                try:
+                    self.images = [os.path.relpath(i, path) for i in glob.glob(os.path.join(path, 'images', '*.*'))]
+                    assert len(self.images) > 0, "Can't find data; make sure you specify the path to your dataset"
+                    self.images.sort()
+                    break
+                except:
+                    print('failed to load dataset, try %02d times'%i)
+                    time.sleep(0.5)
+
+        self.transform = transforms.Compose([
+            transforms.Resize(image_size, interpolation=F.InterpolationMode.LANCZOS),
+            transforms.CenterCrop(image_size),
+        ])
+
+        self.image_shape = [3, image_size, image_size]
+        self.label_shape = 0
+        self.label_dim = 0
+        self.has_labels = False
+        self.resolution = image_size
+        self.num_channels = 3
+        self.name = "SDIP"
+
+
+    def __getitem__(self, idx):
+        image = PIL.Image.open(os.path.join(self.path, self.images[idx]))
+        image = np.array(self.transform(image))
+        if image.ndim == 2:
+            image = image[:, :, np.newaxis] # HW => HWC
+
+        if image.shape[-1] == 1: image = np.repeat(image, 3, axis=-1)
+        if image.shape[-1] == 4: image = image[..., :3]
+
+        image = image.transpose(2, 0, 1) # HWC => CHW
+        return image.copy(), np.zeros([self.label_dim])
+
+    def __len__(self):
+        return len(self.images)
+
+
+    def _get_raw_labels(self):
+        return self._raw_labels
+
+
+    def get_label(self, idx):
+        return np.zeros([self.label_dim])
+    
 #----------------------------------------------------------------------------

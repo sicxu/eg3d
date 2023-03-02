@@ -34,8 +34,9 @@ from training.crosssection_utils import sample_cross_section
 
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
-    gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
-    gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
+    # gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
+    # gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
+    gw, gh = 4, 4
 
     # No labels => show random subset of training samples.
     if not training_set.has_labels:
@@ -68,6 +69,7 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
 
     # Load data.
     images, labels = zip(*[training_set[i] for i in grid_indices])
+
     return (gw, gh), np.stack(images), np.stack(labels)
 
 #----------------------------------------------------------------------------
@@ -89,6 +91,25 @@ def save_image_grid(img, fname, drange, grid_size):
         PIL.Image.fromarray(img[:, :, 0], 'L').save(fname)
     if C == 3:
         PIL.Image.fromarray(img, 'RGB').save(fname)
+
+#----------------------------------------------------------------------------
+
+def sample_pose(rendering_kwargs, batch_size, device='cpu'):
+    lookat_position = torch.tensor(rendering_kwargs['avg_camera_pivot'], dtype=torch.float32, device=device)
+    lookat_position = lookat_position.unsqueeze(0).repeat(batch_size, 1)
+    forward_cam2world_pose = LookAtPoseSampler.sample(
+                3.14/2, 3.14/2, 
+                lookat_position=lookat_position,
+                horizontal_stddev=rendering_kwargs['h_std'], 
+                vertical_stddev=rendering_kwargs['v_std'], 
+                radius=rendering_kwargs['avg_camera_radius'], 
+                batch_size=batch_size,
+                device=device)
+            
+    intrinsics = torch.tensor([[4.2647, 0, 0.5], [0, 4.2647, 0.5], [0, 0, 1]], device=device)
+    intrinsics = intrinsics.unsqueeze(0).repeat(batch_size, 1, 1)
+    return torch.cat([forward_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
+
 
 #----------------------------------------------------------------------------
 
@@ -156,24 +177,31 @@ def training_loop(
         print('Constructing networks...')
     common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=training_set.num_channels)
     G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
-    G.register_buffer('dataset_label_std', torch.tensor(training_set.get_label_std()).to(device))
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G_ema = copy.deepcopy(G).eval()
 
     # Resume from existing pickle.
-    if (resume_pkl is not None) and (rank == 0):
-        print(f'Resuming from "{resume_pkl}"')
-        with dnnlib.util.open_url(resume_pkl) as f:
-            resume_data = legacy.load_network_pkl(f)
-        for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
-            misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
+    resume_opt_data = None
+    if resume_pkl is not None:
+        if rank == 0:
+            print(f'Resuming networks from "{resume_pkl}"')
+            with dnnlib.util.open_url(resume_pkl) as f:
+                resume_data = legacy.load_network_pkl(f)
+            for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
+                misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
+
+        resume_opt_pkl = resume_pkl.replace('.pkl', '_opt.pkl')
+        if resume_opt_pkl is not None:
+            resume_opt_data = torch.load(resume_opt_pkl, map_location='cpu')
+
 
     # Print network summary tables.
     if rank == 0:
         z = torch.empty([batch_gpu, G.z_dim], device=device)
         c = torch.empty([batch_gpu, G.c_dim], device=device)
-        img = misc.print_module_summary(G, [z, c])
-        misc.print_module_summary(D, [img, c])
+        pose = torch.empty([batch_gpu, training_set_kwargs['pose_dim']], device=device)
+        img = misc.print_module_summary(G, [z, c, pose])
+        misc.print_module_summary(D, [img, c, pose])
 
     # Setup augmentation.
     if rank == 0:
@@ -203,6 +231,12 @@ def training_loop(
     for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
         if reg_interval is None:
             opt = dnnlib.util.construct_class_by_name(params=module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+            # Resume opt from existing pickle.
+            if resume_opt_data is not None:
+                if name in resume_opt_data:
+                    print(f'Resuming "{name}" opt from "{resume_pkl}"')
+                    opt.load_state_dict(resume_opt_data[name])
+            
             phases += [dnnlib.EasyDict(name=name+'both', module=module, opt=opt, interval=1)]
         else: # Lazy regularization.
             mb_ratio = reg_interval / (reg_interval + 1)
@@ -210,8 +244,16 @@ def training_loop(
             opt_kwargs.lr = opt_kwargs.lr * mb_ratio
             opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
             opt = dnnlib.util.construct_class_by_name(module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+            # Resume opt from existing pickle.
+            if resume_opt_data is not None:
+                if name in resume_opt_data:
+                    print(f'Resuming "{name}" opt from "{resume_pkl}"')
+                    opt.load_state_dict(resume_opt_data[name])
+
             phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
             phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
+
+
     for phase in phases:
         phase.start_event = None
         phase.end_event = None
@@ -223,13 +265,14 @@ def training_loop(
     grid_size = None
     grid_z = None
     grid_c = None
+    grid_pose = None
     if rank == 0:
         print('Exporting sample images...')
         grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
         save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
         grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
-
+        grid_pose = sample_pose(G.rendering_kwargs, images.shape[0], device).split(batch_gpu)
     # Initialize logs.
     if rank == 0:
         print('Initializing logs...')
@@ -250,7 +293,7 @@ def training_loop(
         print(f'Training for {total_kimg} kimg...')
         print()
     cur_nimg = resume_kimg * 1000
-    cur_tick = 0
+    cur_tick = 0    
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
     maintenance_time = tick_start_time - start_time
@@ -266,12 +309,16 @@ def training_loop(
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
-            all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
+
+            all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]       
             all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
 
+            all_gen_pose = sample_pose(G.rendering_kwargs, len(phases) * batch_size, device=device)
+            all_gen_pose = [phase_gen_p.split(batch_gpu) for phase_gen_p in all_gen_pose.split(batch_size)]
+
         # Execute training phases.
-        for phase, phase_gen_z, phase_gen_c in zip(phases, all_gen_z, all_gen_c):
+        for phase, phase_gen_z, phase_gen_c, phase_gen_pose in zip(phases, all_gen_z, all_gen_c, all_gen_pose):
             if batch_idx % phase.interval != 0:
                 continue
             if phase.start_event is not None:
@@ -280,8 +327,10 @@ def training_loop(
             # Accumulate gradients.
             phase.opt.zero_grad(set_to_none=True)
             phase.module.requires_grad_(True)
-            for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
-                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
+            
+            # 16 + 9
+            for real_img, real_c, gen_z, gen_c, gen_pose in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c, phase_gen_pose):
+                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gen_pose=gen_pose, gain=phase.interval, cur_nimg=cur_nimg)
             phase.module.requires_grad_(False)
 
             # Update weights.
@@ -358,7 +407,7 @@ def training_loop(
 
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            out = [G_ema(z=z, c=c, noise_mode='const') for z, c in zip(grid_z, grid_c)]
+            out = [G_ema(z=z, c=c, pose=pose, noise_mode='const') for z, c, pose in zip(grid_z, grid_c, grid_pose)]
             images = torch.cat([o['image'].cpu() for o in out]).numpy()
             images_raw = torch.cat([o['image_raw'].cpu() for o in out]).numpy()
             images_depth = -torch.cat([o['image_depth'].cpu() for o in out]).numpy()
@@ -407,6 +456,16 @@ def training_loop(
             if rank == 0:
                 with open(snapshot_pkl, 'wb') as f:
                     pickle.dump(snapshot_data, f)
+            
+            if rank == 0:
+                opt_data = {}
+                for phase in phases:
+                    for name in ['G', 'D']:
+                        if phase.name.startswith(name) and (name not in opt_data):
+                            opt_data[name] = phase.opt.state_dict()
+                opt_pkl = snapshot_pkl.replace('.pkl', '_opt.pkl')
+                torch.save(opt_data, opt_pkl)
+
 
         # Evaluate metrics.
         if (snapshot_data is not None) and (len(metrics) > 0):

@@ -26,7 +26,7 @@ from training import training_loop
 from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
-
+import glob
 #----------------------------------------------------------------------------
 
 def subprocess_fn(rank, c, temp_dir):
@@ -55,16 +55,7 @@ def subprocess_fn(rank, c, temp_dir):
 
 def launch_training(c, desc, outdir, dry_run):
     dnnlib.util.Logger(should_flush=True)
-
-    # Pick output directory.
-    prev_run_dirs = []
-    if os.path.isdir(outdir):
-        prev_run_dirs = [x for x in os.listdir(outdir) if os.path.isdir(os.path.join(outdir, x))]
-    prev_run_ids = [re.match(r'^\d+', x) for x in prev_run_dirs]
-    prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
-    cur_run_id = max(prev_run_ids, default=-1) + 1
-    c.run_dir = os.path.join(outdir, f'{cur_run_id:05d}-{desc}')
-    assert not os.path.exists(c.run_dir)
+    c.run_dir = outdir
 
     # Print options.
     print()
@@ -89,7 +80,7 @@ def launch_training(c, desc, outdir, dry_run):
 
     # Create output directory.
     print('Creating output directory...')
-    os.makedirs(c.run_dir)
+    os.makedirs(c.run_dir, exist_ok=True)
     with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
         json.dump(c, f, indent=2)
 
@@ -104,9 +95,8 @@ def launch_training(c, desc, outdir, dry_run):
 
 #----------------------------------------------------------------------------
 
-def init_dataset_kwargs(data):
+def init_dataset_kwargs(dataset_kwargs):
     try:
-        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
         dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # Subclass of training.dataset.Dataset.
         dataset_kwargs.resolution = dataset_obj.resolution # Be explicit about resolution.
         dataset_kwargs.use_labels = dataset_obj.has_labels # Be explicit about labels.
@@ -132,6 +122,7 @@ def parse_comma_separated_list(s):
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
 @click.option('--cfg',          help='Base configuration',                                      type=str, required=True)
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
+@click.option('--dataset_name', help='dataset name', metavar='STR',                             type=str, default='ImageFolderDataset', required=False)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
 @click.option('--gamma',        help='R1 regularization weight', metavar='FLOAT',               type=click.FloatRange(min=0), required=True)
@@ -141,6 +132,7 @@ def parse_comma_separated_list(s):
 @click.option('--mirror',       help='Enable dataset x-flips', metavar='BOOL',                  type=bool, default=False, show_default=True)
 @click.option('--aug',          help='Augmentation mode',                                       type=click.Choice(['noaug', 'ada', 'fixed']), default='noaug', show_default=True)
 @click.option('--resume',       help='Resume from given network pickle', metavar='[PATH|URL]',  type=str)
+@click.option('--resume_opt',   help='resume for neural resolution finetuning or resume from previous checkpoint, choose from [Finetune|resume_job|resume_only_checkpoint]', type=str, default='resume_job')
 @click.option('--freezed',      help='Freeze first layers of D', metavar='INT',                 type=click.IntRange(min=0), default=0, show_default=True)
 
 # Misc hyperparameters.
@@ -173,6 +165,7 @@ def parse_comma_separated_list(s):
 
 @click.option('--blur_fade_kimg', help='Blur over how many', metavar='INT',  type=click.IntRange(min=1), required=False, default=200)
 @click.option('--gen_pose_cond', help='If true, enable generator pose conditioning.', metavar='BOOL',  type=bool, required=False, default=False)
+@click.option('--fix_gen_cond', help='If true, fix generator pose conditioning.', metavar='BOOL',  type=bool, required=False, default=False)
 @click.option('--c-scale', help='Scale factor for generator pose conditioning.', metavar='FLOAT',  type=click.FloatRange(min=0), required=False, default=1)
 @click.option('--c-noise', help='Add noise for generator pose conditioning.', metavar='FLOAT',  type=click.FloatRange(min=0), required=False, default=0)
 @click.option('--gpc_reg_prob', help='Strength of swapping regularization. None means no generator pose conditioning, i.e. condition with zeros.', metavar='FLOAT',  type=click.FloatRange(min=0), required=False, default=0.5)
@@ -227,11 +220,13 @@ def main(**kwargs):
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
 
     # Training set.
-    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
+    dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.%s'%opts.dataset_name, path=opts.data, use_labels=True, max_size=None, xflip=False)
+    c.training_set_kwargs, dataset_name = init_dataset_kwargs(dataset_kwargs)
     if opts.cond and not c.training_set_kwargs.use_labels:
         raise click.ClickException('--cond=True requires labels specified in dataset.json')
     c.training_set_kwargs.use_labels = opts.cond
     c.training_set_kwargs.xflip = opts.mirror
+    c.training_set_kwargs.pose_dim = 25 # 4*4 +3*3
 
     # Hyperparameters & settings.
     c.num_gpus = opts.gpus
@@ -329,6 +324,18 @@ def main(**kwargs):
             'avg_camera_radius': 1.7,
             'avg_camera_pivot': [0, 0, 0],
         })
+    elif opts.cfg == "jianfeng":
+        rendering_options.update({
+            'depth_resolution': 48, # number of uniform samples to take per ray.
+            'depth_resolution_importance': 48, # number of importance samples to take per ray.
+            'ray_start': 2.25, # near point along each ray to start taking samples.
+            'ray_end': 3.3, # far point along each ray to stop taking samples. 
+            'box_warp': 1, # the side-length of the bounding box spanned by the tri-planes; box_warp=1 means [-0.5, -0.5, -0.5] -> [0.5, 0.5, 0.5].
+            'avg_camera_radius': 2.7, # used only in the visualizer to specify camera orbit radius.
+            'avg_camera_pivot': [0, 0, 0], # used only in the visualizer to control center of camera rotation.
+            'h_std': 0.3, 
+            'v_std': 0.155
+        })
     else:
         assert False, "Need to specify config"
 
@@ -369,6 +376,40 @@ def main(**kwargs):
         if not opts.resume_blur:
             c.loss_kwargs.blur_init_sigma = 0 # Disable blur rampup.
             c.loss_kwargs.gpc_reg_fade_kimg = 0 # Disable swapping rampup
+
+    if opts.resume_opt == 'finetune':
+        print("choose the finetune resume option")
+        # used for finetuning to large neural resolution, follows eg3d setting
+        if opts.resume is not None:
+            c.resume_pkl = opts.resume
+            c.ada_kimg = 100 # Make ADA react faster at the beginning.
+            c.ema_rampup = None # Disable EMA rampup.
+            if not opts.resume_blur:
+                c.loss_kwargs.blur_init_sigma = 0 # Disable blur rampup.
+                c.loss_kwargs.gpc_reg_fade_kimg = 0 # Disable swapping rampup
+
+    elif opts.resume_opt == 'resume_job':
+        print("choose the resume_job resume option")
+        # resuming previous checkpoint
+        out_root = opts.outdir
+        checkpoints_list = sorted([i for i in glob.glob(os.path.join(out_root, "network*.pkl")) if 'opt' not in i])
+        if len(checkpoints_list) >= 1:
+            opts.resume = checkpoints_list[-1]
+            print("Find previous checkpoints!", opts.resume)
+            # update the step
+            c.resume_kimg = int(checkpoints_list[-1].split("/")[-1].split('-')[-1].split('.')[0])
+            c.resume_pkl = opts.resume
+            
+    elif opts.resume_opt == 'resume_only_checkpoint':
+        print("choose the resume_only_checkpoint resume option")
+        # resume from other experiment's checkpoint, and tune the parameters
+        if opts.resume is not None:
+            c.resume_pkl = opts.resume
+
+        
+    # Resume.
+
+
 
     # Performance-related toggles.
     # if opts.fp32:

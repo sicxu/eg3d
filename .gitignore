@@ -14,6 +14,7 @@ archive
 *.ply
 eval
 out
+.vscode
 
 # evaluation:
 temp/
@@ -25,3 +26,5 @@ vids/
 stylegan3/results
 eg3d/results
 eg3d_results
+eg3d/training-runs
+eg3d/EG3D_jobs
