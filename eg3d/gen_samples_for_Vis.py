@@ -27,7 +27,7 @@ import legacy
 from camera_utils import LookAtPoseSampler, FOV_to_intrinsics
 from torch_utils import misc
 from training.triplane import TriPlaneGenerator
-
+import imageio
 
 #----------------------------------------------------------------------------
 
@@ -114,6 +114,10 @@ def create_samples(N=256, voxel_origin=[0, 0, 0], cube_length=2.0):
 @click.option('--fov-deg', help='Field of View of camera in degrees', type=int, required=False, metavar='float', default=18.837, show_default=True)
 @click.option('--shape-format', help='Shape Format', type=click.Choice(['.mrc', '.ply']), default='.mrc')
 @click.option('--reload_modules', help='Overload persistent modules?', type=bool, required=False, metavar='BOOL', default=False, show_default=True)
+@click.option('--save_gif', help='save gif or images', type=bool, required=False, metavar='BOOL', default=False, show_default=True)
+@click.option('--frames', help='', type=int, required=False, metavar='int', default=30, show_default=True)
+
+
 def generate_images(
     network_pkl: str,
     seeds: List[int],
@@ -126,6 +130,8 @@ def generate_images(
     shape_format: str,
     class_idx: Optional[int],
     reload_modules: bool,
+    save_gif: bool,
+    frames: int
 ):
     """Generate images using pretrained network pickle.
 
@@ -153,33 +159,41 @@ def generate_images(
 
     os.makedirs(outdir, exist_ok=True)
 
-    cam2world_pose = LookAtPoseSampler.sample(3.14/2, 3.14/2, torch.tensor([0, 0, 0.2], device=device), radius=2.7, device=device)
     intrinsics = FOV_to_intrinsics(fov_deg, device=device)
-
     # Generate images.
     for seed_idx, seed in enumerate(seeds):
         print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
         z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim)).to(device)
 
         imgs = []
-        angle_p = -0.2
-        for angle_y, angle_p in [(.4, angle_p), (0, angle_p), (-.4, angle_p)]:
+        angle_p = 0
+        min_angle_y, max_angle_y = -0.4, 0.4
+        angle_list = [(angle_y, angle_p) for angle_y in np.linspace(max_angle_y, min_angle_y, num=frames)]
+        for angle_y, angle_p in angle_list:
             cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
             cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
             cam2world_pose = LookAtPoseSampler.sample(np.pi/2 + angle_y, np.pi/2 + angle_p, cam_pivot, radius=cam_radius, device=device)
-            conditioning_cam2world_pose = LookAtPoseSampler.sample(np.pi/2, np.pi/2, cam_pivot, radius=cam_radius, device=device)
             camera_params = torch.cat([cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
-            conditioning_params = torch.cat([conditioning_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
-
+            if class_idx is not None:
+                c_numpy = np.zeros([G.c_dim], dtype=np.float32)
+                c_numpy[class_idx] = 1
+                c_numpy = c_numpy.reshape(-1, G.c_dim)
+            else:
+                c_numpy = np.zeros([1, 0], dtype=np.float32)
+            conditioning_params = torch.tensor(c_numpy, device=device)
             ws = G.mapping(z, conditioning_params, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-            img = G.synthesis(ws, camera_params)['image']
+            img = G.synthesis(ws, camera_params, noise_mode='const')['image']
 
             img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
             imgs.append(img)
 
-        img = torch.cat(imgs, dim=2)
+        if not save_gif:
+            img = torch.cat(imgs, dim=2)
+            PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
+        else:
+            img = torch.cat(imgs)
+            imageio.mimsave(f'{outdir}/seed{seed:04d}.gif', img.cpu().numpy(), fps=15)
 
-        PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
 
         if shapes:
             # extract a shape.mrc with marching cubes. You can view the .mrc file using ChimeraX from UCSF.
