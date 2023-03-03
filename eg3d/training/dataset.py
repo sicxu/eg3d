@@ -334,17 +334,20 @@ class ImageNet(torch.utils.data.Dataset):
 
 
     def __getitem__(self, idx):
-        image = PIL.Image.open(os.path.join(self.path, self.images[idx]))
-        image = np.array(self.transform(image))
-        if image.ndim == 2:
-            image = image[:, :, np.newaxis] # HW => HWC
+        try: 
+            image = PIL.Image.open(os.path.join(self.path, self.images[idx]))
+            image = np.array(self.transform(image))
+            if image.ndim == 2:
+                image = image[:, :, np.newaxis] # HW => HWC
 
-        if image.shape[-1] == 1: image = np.repeat(image, 3, axis=-1)
-        if image.shape[-1] == 4: image = image[..., :3]
+            if image.shape[-1] == 1: image = np.repeat(image, 3, axis=-1)
+            if image.shape[-1] == 4: image = image[..., :3]
 
-        image = image.transpose(2, 0, 1) # HWC => CHW
-        return image.copy(), self.get_label(idx)
-
+            image = image.transpose(2, 0, 1) # HWC => CHW
+            return image.copy(), self.get_label(idx)
+        except Exception as e:
+            print(e)
+            return self.__getitem__(np.random.randint(self.__len__()))
 
     def __len__(self):
         return len(self.images)
