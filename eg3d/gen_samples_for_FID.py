@@ -42,6 +42,23 @@ def iterate_random_labels(dataset_kwargs, batch_size, c_dim, device):
             c = torch.from_numpy(np.stack(c)).pin_memory().to(device)
             yield c
 
+def iterate_fixed_labels(batch_size, total_size, c_dim, device):
+    if c_dim == 0:
+        c = torch.zeros([batch_size, c_dim], device=device)
+        while True:
+            yield c
+    else:
+        all_labels = torch.zeros([total_size, c_dim])
+        intervals = total_size // c_dim
+        for i in range(c_dim):
+            labels = torch.zeros([intervals, c_dim])
+            labels[:, i] = 1
+            all_labels[i * intervals: (i + 1) * intervals] = labels
+
+        for i in range(total_size // batch_size):
+            c = all_labels[i * batch_size: (i + 1) * batch_size].pin_memory().to(device)
+            yield c
+
 def iterate_random_pose(rendering_kwargs, batch_size, device='cpu'):
     while True:
         lookat_position = torch.tensor(rendering_kwargs['avg_camera_pivot'], dtype=torch.float32, device=device)
@@ -93,20 +110,23 @@ def generate_images(
         G = legacy.load_network_pkl(f)['G_ema'].to(device) # type: ignore
 
     dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.%s'%dataset_name, path=data, use_labels=True, max_size=None, xflip=False)
-    c_iter = iterate_random_labels(dataset_kwargs, batch_size=batch_size, c_dim=G.c_dim, device=device)
+    c_iter = iterate_fixed_labels(batch_size=batch_size, total_size=frames, c_dim=G.c_dim, device=device)
     pose_iter = iterate_random_pose(G.rendering_kwargs, batch_size=batch_size, device=device)
     outdir = os.path.join(outdir, f"sampled-{frames//1000}k-{network_pkl.split('/')[-1].split('.')[0]:s}")
     os.makedirs(outdir, exist_ok=True)
 
     # Generate images.
-    for i in range(frames // batch_size):
+    iters = round(frames / batch_size + 0.5)
+    for i in range(iters):
         print('Generating image for batch %d...' % (i))
         z = torch.randn([batch_size, G.z_dim], device=device)
-        ws = G.mapping(z, c=next(c_iter))
+        c = next(c_iter)
+        ws = G.mapping(z, c=c)
         img = G.synthesis(ws, pose=next(pose_iter))['image']
         img = (img.permute(0, 2, 3, 1)  * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        label = torch.where(c == 1)[1]
         for j in range(batch_size):
-            PIL.Image.fromarray(img[j].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_{i*batch_size + j:05d}.png')
+            PIL.Image.fromarray(img[j].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_label{label[j]:04d}_{i*batch_size + j:05d}.png')
 
 #----------------------------------------------------------------------------
 

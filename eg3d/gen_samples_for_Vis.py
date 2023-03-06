@@ -157,6 +157,7 @@ def generate_images(
         G_new.rendering_kwargs = G.rendering_kwargs
         G = G_new
 
+    outdir = os.path.join(outdir, f"sampled-{len(seeds):d}-{network_pkl.split('/')[-1].split('.')[0]:s}-trunc{truncation_psi:.2f}")
     os.makedirs(outdir, exist_ok=True)
 
     intrinsics = FOV_to_intrinsics(fov_deg, device=device)
@@ -166,9 +167,14 @@ def generate_images(
         z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim)).to(device)
 
         imgs = []
-        angle_p = 0
-        min_angle_y, max_angle_y = -0.4, 0.4
-        angle_list = [(angle_y, angle_p) for angle_y in np.linspace(max_angle_y, min_angle_y, num=frames)]
+        # angle_p = 0
+        # min_angle_y, max_angle_y = -0.4, 0.4
+        # angle_list = [(angle_y, angle_p) for angle_y in np.linspace(max_angle_y, min_angle_y, num=frames)]
+        angle_list = [
+                      (0.6, 0.15), (0, 0.15), (-0.6, 0.15), 
+                      (0.6, 0), (0, 0), (-0.6, 0), 
+                      (0.6, -0.15), (0, -0.15), (-0.6, -0.15)
+                ]
         for angle_y, angle_p in angle_list:
             cam_pivot = torch.tensor(G.rendering_kwargs.get('avg_camera_pivot', [0, 0, 0]), device=device)
             cam_radius = G.rendering_kwargs.get('avg_camera_radius', 2.7)
@@ -188,7 +194,9 @@ def generate_images(
             imgs.append(img)
 
         if not save_gif:
-            img = torch.cat(imgs, dim=2)
+            # img = torch.cat(imgs, dim=2)
+            img = torch.cat([torch.cat(imgs[:3], dim=2), torch.cat(imgs[3: 6], dim=2), torch.cat(imgs[6:], dim=2)], dim=1)
+
             PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
         else:
             img = torch.cat(imgs)
